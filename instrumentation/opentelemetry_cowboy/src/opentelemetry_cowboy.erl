@@ -29,7 +29,13 @@ attach_event_handlers() ->
 
 handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Config) ->
     Headers = maps:get(headers, Req),
-    otel_propagator_text_map:extract(maps:to_list(Headers)),
+    % Workaround: since we currently don't have dragon spans going into our otel-collector/refinery, we can't make sampling decisions
+    % based on the root-span. So instead of marking the incoming traceparent as the parent we just link to it.
+    % That way tiger creates the root-span but we still keep linking the two.
+    % Once we have dragon-spans integrated we can switch back to the original library (or once we can upgrade to the latest version which includes the `public_endpoint` config)
+    PropagatedCtx = otel_propagator_text_map:extract_to(otel_ctx:new(), maps:to_list(Headers)),
+    SpanCtx = otel_tracer:current_span_ctx(PropagatedCtx),
+
     {RemoteIP, _Port} = maps:get(peer, Req),
     Method = maps:get(method, Req),
 
@@ -46,7 +52,7 @@ handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Con
                   'net.transport' => 'IP.TCP'
                  },
     SpanName = iolist_to_binary([<<"HTTP ">>, Method]),
-    Opts = #{attributes => Attributes, kind => ?SPAN_KIND_SERVER},
+    Opts = #{attributes => Attributes, kind => ?SPAN_KIND_SERVER, links => opentelemetry:links([SpanCtx])},
     otel_telemetry:start_telemetry_span(?TRACER_ID, SpanName, Meta, Opts);
 
 handle_event([cowboy, request, stop], Measurements, Meta, _Config) ->
