@@ -3,7 +3,10 @@
 -export([
          setup/0,
          setup/1,
-         handle_event/4]).
+         handle_event/4,
+         is_public_endpoint/2,
+         default_public_endpoint_fn/2
+]).
 
 -include_lib("opentelemetry_api/include/opentelemetry.hrl").
 
@@ -29,12 +32,20 @@ attach_event_handlers() ->
 
 handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Config) ->
     Headers = maps:get(headers, Req),
-    % Workaround: since we currently don't have dragon spans going into our otel-collector/refinery, we can't make sampling decisions
-    % based on the root-span. So instead of marking the incoming traceparent as the parent we just link to it.
-    % That way tiger creates the root-span but we still keep linking the two.
-    % Once we have dragon-spans integrated we can switch back to the original library (or once we can upgrade to the latest version which includes the `public_endpoint` config)
-    PropagatedCtx = otel_propagator_text_map:extract_to(otel_ctx:new(), maps:to_list(Headers)),
-    SpanCtx = otel_tracer:current_span_ctx(PropagatedCtx),
+    
+    % Check if this is a public endpoint that should distrust external traceparent headers
+    {PropagatedCtx, SpanCtx} = case is_public_endpoint(Req, #{public_endpoint => false}) of
+        false ->
+            % For internal endpoints, trust the traceparent header as before
+            {undefined, undefined};
+        true ->
+            % For public endpoints, don't trust external traceparent headers
+            % This prevents orphaned spans from external services like Zendesk
+            % Start a new root span instead of linking to external trace
+            PCtx = otel_propagator_text_map:extract_to(otel_ctx:new(), maps:to_list(Headers)),
+            SCtx = otel_tracer:current_span_ctx(PCtx),
+            {PCtx, SCtx}
+    end,
 
     {RemoteIP, _Port} = maps:get(peer, Req),
     Method = maps:get(method, Req),
@@ -52,7 +63,15 @@ handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Con
                   'net.transport' => 'IP.TCP'
                  },
     SpanName = iolist_to_binary([<<"HTTP ">>, Method]),
-    Opts = #{attributes => Attributes, kind => ?SPAN_KIND_SERVER, links => opentelemetry:links([SpanCtx])},
+    
+    % Only create links if we have a valid span context from trusted sources
+    Opts = case SpanCtx of
+               undefined ->
+                   #{attributes => Attributes, kind => ?SPAN_KIND_SERVER};
+               _ ->
+                   #{attributes => Attributes, kind => ?SPAN_KIND_SERVER, links => opentelemetry:links([SpanCtx])}
+           end,
+    
     otel_telemetry:start_telemetry_span(?TRACER_ID, SpanName, Meta, Opts);
 
 handle_event([cowboy, request, stop], Measurements, Meta, _Config) ->
@@ -145,3 +164,13 @@ client_ip(Headers, RemoteIP) ->
       Addresses ->
           hd(binary:split(Addresses, <<",">>))
   end.
+
+% Determine if this endpoint should distrust external traceparent headers
+% This function implements the is_public_endpoint logic to prevent orphaned spans
+is_public_endpoint(_Req, #{public_endpoint := true}) -> true;
+is_public_endpoint(Req, #{public_endpoint_fn := {M, F, A}}) ->
+    apply(M, F, [Req, A]);
+is_public_endpoint(_Req, _Config) -> false.
+
+% Default function that always returns false (internal endpoint)
+default_public_endpoint_fn(_, _) -> false.
