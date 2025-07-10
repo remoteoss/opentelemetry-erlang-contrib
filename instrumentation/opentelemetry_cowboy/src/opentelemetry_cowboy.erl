@@ -34,17 +34,16 @@ handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Con
     Headers = maps:get(headers, Req),
     
     % Check if this is a public endpoint that should distrust external traceparent headers
-    {PropagatedCtx, SpanCtx} = case is_public_endpoint(Req, #{public_endpoint => false}) of
+    SpanCtx = case is_public_endpoint(Req, #{public_endpoint => false}) of
         true ->
             % For public endpoints, don't trust external traceparent headers
             % This prevents orphaned spans from external services like Zendesk
             % Start a new root span instead of linking to external trace
-            {undefined, undefined};
+            undefined;
         false ->
             % For internal endpoints, trust the traceparent header as before
             PCtx = otel_propagator_text_map:extract_to(otel_ctx:new(), maps:to_list(Headers)),
-            SCtx = otel_tracer:current_span_ctx(PCtx),
-            {PCtx, SCtx}
+            otel_tracer:current_span_ctx(PCtx)
     end,
 
     {RemoteIP, _Port} = maps:get(peer, Req),
