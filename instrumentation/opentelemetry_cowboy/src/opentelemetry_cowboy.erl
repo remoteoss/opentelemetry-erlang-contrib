@@ -12,39 +12,26 @@
 
 -define(TRACER_ID, ?MODULE).
 
--spec setup() -> ok.
-setup() ->
-    setup([]).
+setup() -> setup(#{}).
 
--spec setup([]) -> ok.
-setup(_Opts) ->
-    attach_event_handlers(),
+setup(Opts) when is_list(Opts) ->
+    setup(maps:from_list(Opts));
+setup(Opts) when is_map(Opts) ->
+    attach_event_handlers(Opts),
     ok.
 
-attach_event_handlers() ->
+attach_event_handlers(Opts) ->
     Events = [
               [cowboy, request, early_error],
               [cowboy, request, start],
               [cowboy, request, stop],
               [cowboy, request, exception]
              ],
-    telemetry:attach_many(opentelemetry_cowboy_handlers, Events, fun ?MODULE:handle_event/4, #{}).
+    telemetry:attach_many(opentelemetry_cowboy_handlers, Events, fun ?MODULE:handle_event/4, Opts).
 
-handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Config) ->
+handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, Config) ->
     Headers = maps:get(headers, Req),
     
-    % Check if this is a public endpoint that should distrust external traceparent headers
-    SpanCtx = case is_public_endpoint(Req, #{public_endpoint => false}) of
-        true ->
-            % For public endpoints, don't trust external traceparent headers
-            % This prevents orphaned spans from external services like Zendesk
-            % Start a new root span instead of linking to external trace
-            undefined;
-        false ->
-            % For internal endpoints, trust the traceparent header as before
-            PCtx = otel_propagator_text_map:extract_to(otel_ctx:new(), maps:to_list(Headers)),
-            otel_tracer:current_span_ctx(PCtx)
-    end,
 
     {RemoteIP, _Port} = maps:get(peer, Req),
     Method = maps:get(method, Req),
@@ -62,16 +49,27 @@ handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, _Con
                   'net.transport' => 'IP.TCP'
                  },
     SpanName = iolist_to_binary([<<"HTTP ">>, Method]),
+
+    io:format("Map: ~p~n", [Config]),
+
     
     % Only create links if we have a valid span context from trusted sources
-    Opts = case SpanCtx of
-               undefined ->
-                   #{attributes => Attributes, kind => ?SPAN_KIND_SERVER};
-               _ ->
-                   #{attributes => Attributes, kind => ?SPAN_KIND_SERVER, links => opentelemetry:links([SpanCtx])}
-           end,
-    
-    otel_telemetry:start_telemetry_span(?TRACER_ID, SpanName, Meta, Opts);
+    case is_public_endpoint(Req, Config) of
+        false ->
+            otel_propagator_text_map:extract(maps:to_list(Headers)),
+            otel_telemetry:start_telemetry_span(?TRACER_ID, SpanName, Meta, #{
+                attributes => Attributes,
+                kind => ?SPAN_KIND_SERVER
+            });
+        true ->
+            PropagatedCtx = otel_propagator_text_map:extract_to(otel_ctx:new(), maps:to_list(Headers)),
+            SpanCtx = otel_tracer:current_span_ctx(PropagatedCtx),
+            otel_telemetry:start_telemetry_span(?TRACER_ID, SpanName, Meta, #{
+                attributes => Attributes,
+                kind => ?SPAN_KIND_SERVER,
+                links => opentelemetry:links([SpanCtx])
+            })
+    end;
 
 handle_event([cowboy, request, stop], Measurements, Meta, _Config) ->
     Ctx = otel_telemetry:set_current_telemetry_span(?TRACER_ID, Meta),
