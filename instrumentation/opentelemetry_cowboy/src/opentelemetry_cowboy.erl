@@ -50,9 +50,6 @@ handle_event([cowboy, request, start], _Measurements, #{req := Req} = Meta, Conf
                  },
     SpanName = iolist_to_binary([<<"HTTP ">>, Method]),
 
-    io:format("Map: ~p~n", [Config]),
-
-    
     % Only create links if we have a valid span context from trusted sources
     case is_public_endpoint(Req, Config) of
         false ->
